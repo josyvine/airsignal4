@@ -1,0 +1,48 @@
+<resources>
+    <string name="app_name">AirSignal</string>
+    <string name="nav_chats">Chats</string>
+    <string name="nav_calls">Calls</string>
+    <string name="nav_contacts">Contacts</string>
+    <string name="nav_transfer">Transfer</string>
+    <string name="nav_settings">Settings</string>
+
+    <!-- Header & Modes -->
+    <string name="status_online">Offline Connect Ready</string>
+    <string name="mode_normal_chat">Normal Chat Mode</string>
+    <string name="mode_sms_data">SMS Data Mode</string>
+    <string name="mode_audio_data">Audio Call Data Mode</string>
+
+    <!-- Chat Fragment -->
+    <string name="search_hint">Search conversations, messages…</string>
+    <string name="type_message_hint">Type a message…</string>
+    <string name="new_chat">New Chat</string>
+    <string name="send">Send</string>
+
+    <!-- Calls Fragment -->
+    <string name="dialer">Dialer</string>
+    <string name="start_audio_data_call">Start Audio Data Call</string>
+    <string name="recent_calls">Recent Calls</string>
+
+    <!-- Transfer Fragment -->
+    <string name="select_file">Select File to Send</string>
+    <string name="send_sms_data">Send via SMS Data</string>
+    <string name="send_audio_data">Send via Audio Call</string>
+    <string name="active_transfers">Active Data Transfers</string>
+    <string name="chunk_packet_inspect">Packet Inspector</string>
+
+    <!-- Settings Fragment -->
+    <string name="profile">User Profile</string>
+    <string name="default_sms_app">Default SMS App Status</string>
+    <string name="default_dialer_app">Default Phone App Status</string>
+    <string name="set_default_sms">Set as Default SMS App</string>
+    <string name="set_default_dialer">Set as Default Phone App</string>
+    <string name="fsk_baud_rate">Audio Data Baud Rate (FSK)</string>
+    <string name="encryption_setting">Local &amp; Transfer Encryption</string>
+    <string name="dark_theme">Dark Theme</string>
+
+    <!-- Statuses -->
+    <string name="status_sending">Sending…</string>
+    <string name="status_sent">Sent</string>
+    <string name="status_delivered">Delivered</string>
+    <string name="status_failed">Failed</string>
+</resources>
