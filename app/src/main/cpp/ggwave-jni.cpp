@@ -3,15 +3,17 @@
 #include <vector>
 #include "ggwave.h"
 
-static ggwave_Instance ggwaveInstance = GGWAVE_INDEX_NULL;
+// In GGWave, instances are just integer IDs. We use -1 to mean "uninitialized".
+static ggwave_Instance ggwaveInstance = -1;
 
 extern "C" {
 
 JNIEXPORT jboolean JNICALL
 Java_com_example_audio_GGWaveEngine_initNative(JNIEnv *env, jobject thiz, jint sampleRate) {
-    if (ggwaveInstance != GGWAVE_INDEX_NULL) {
+    if (ggwaveInstance != -1) {
         ggwave_free(ggwaveInstance);
     }
+    
     ggwave_Parameters params = ggwave_getDefaultParameters();
     params.sampleRateInp = sampleRate;
     params.sampleRateOut = sampleRate;
@@ -19,12 +21,14 @@ Java_com_example_audio_GGWaveEngine_initNative(JNIEnv *env, jobject thiz, jint s
     params.samplesPerFrame = 1024;
     
     ggwaveInstance = ggwave_init(params);
-    return (ggwaveInstance != GGWAVE_INDEX_NULL);
+    
+    // ggwave_init returns a positive integer if successful, or < 0 if it fails.
+    return (ggwaveInstance != -1);
 }
 
 JNIEXPORT jshortArray JNICALL
 Java_com_example_audio_GGWaveEngine_encodeNative(JNIEnv *env, jobject thiz, jbyteArray payload, jint protocolId, jint volume) {
-    if (ggwaveInstance == GGWAVE_INDEX_NULL) return nullptr;
+    if (ggwaveInstance == -1) return nullptr;
 
     jsize payloadLen = env->GetArrayLength(payload);
     jbyte *payloadBytes = env->GetByteArrayElements(payload, nullptr);
@@ -50,7 +54,7 @@ Java_com_example_audio_GGWaveEngine_encodeNative(JNIEnv *env, jobject thiz, jbyt
 
 JNIEXPORT jbyteArray JNICALL
 Java_com_example_audio_GGWaveEngine_decodeNative(JNIEnv *env, jobject thiz, jshortArray pcmBuffer, jint length) {
-    if (ggwaveInstance == GGWAVE_INDEX_NULL || length <= 0) return nullptr;
+    if (ggwaveInstance == -1 || length <= 0) return nullptr;
 
     jshort *pcm = env->GetShortArrayElements(pcmBuffer, nullptr);
     
@@ -69,9 +73,9 @@ Java_com_example_audio_GGWaveEngine_decodeNative(JNIEnv *env, jobject thiz, jsho
 
 JNIEXPORT void JNICALL
 Java_com_example_audio_GGWaveEngine_releaseNative(JNIEnv *env, jobject thiz) {
-    if (ggwaveInstance != GGWAVE_INDEX_NULL) {
+    if (ggwaveInstance != -1) {
         ggwave_free(ggwaveInstance);
-        ggwaveInstance = GGWAVE_INDEX_NULL;
+        ggwaveInstance = -1;
     }
 }
 
