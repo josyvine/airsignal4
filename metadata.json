@@ -1,0 +1,6 @@
+{
+  "name": "AirSignal",
+  "description": "Advanced SMS + Audio Data Communication App for offline data transfer and messaging",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
