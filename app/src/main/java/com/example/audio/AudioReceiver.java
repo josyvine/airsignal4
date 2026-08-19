@@ -100,12 +100,15 @@ public class AudioReceiver {
 
         // Hardware Compatibility Probe Matrix (Supports Huawei EMUI, ColorOS, and Standard Android)
         int[] sampleRates = new int[]{48000, 44100, 16000, 8000};
+        
+        // Reordered to bypass Huawei's zero-energy privacy trap.
         int[] audioSources = new int[]{
-                MediaRecorder.AudioSource.VOICE_RECOGNITION, // Unlocked on Huawei EMUI during calls
-                9,                                           // AudioSource.UNPROCESSED (Direct hardware ADC)
-                MediaRecorder.AudioSource.CAMCORDER,         // Secondary ambient mic
-                MediaRecorder.AudioSource.MIC,               // Standard mic (Oppo / Samsung)
-                MediaRecorder.AudioSource.DEFAULT
+                MediaRecorder.AudioSource.MIC,                 // Best standard fallback (Oppo, Samsung, Huawei)
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION, // Designed specifically to bypass call muting
+                MediaRecorder.AudioSource.DEFAULT,
+                9,                                             // AudioSource.UNPROCESSED (Direct hardware ADC)
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,   // Heavily filtered on Huawei during calls (last resort)
+                MediaRecorder.AudioSource.CAMCORDER            // Secondary ambient mic
         };
 
         boolean initialized = false;
