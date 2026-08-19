@@ -19,7 +19,8 @@ public class AudioEncoder {
 
     private static final String TAG = "AudioEncoder";
 
-    public static final int SAMPLE_RATE = 44100;
+    public static final int SAMPLE_RATE = 48000;
+    public static final int FALLBACK_SAMPLE_RATE = 44100;
     public static final int MARK_FREQ = 1200;   // Bit 1 (Hz)
     public static final int SPACE_FREQ = 2200;  // Bit 0 (Hz)
 
@@ -112,7 +113,8 @@ public class AudioEncoder {
 
     /**
      * Transmits a single payload over the voice call.
-     * Uses Call.playDtmfTone to bypass hardware AEC during calls, with PCM synthesizer fallback.
+     * Uses Call.playDtmfTone to bypass hardware AEC during calls, with GGWave MFSK native engine
+     * and synthesized PCM fallback for speaker acoustic channels.
      */
     public void transmitDataOverAudio(final byte[] data, final OnTransmissionProgressListener listener) {
         if (data == null || data.length == 0) {
@@ -130,11 +132,25 @@ public class AudioEncoder {
                     AirLogger.i(TAG, "Transmitting data payload directly over active cellular call channel (" + data.length + " bytes)...");
                     transmitPayloadViaCallChannel(activeCall, data, listener);
                 } else {
-                    // Fallback to synthesized PCM audio track
-                    AirLogger.i(TAG, "No active telephony call attached. Using synthesized PCM audio fallback.");
-                    byte[] framedData = applyFrameEncapsulation(data);
-                    short[] pcmSamples = generateContinuousPhaseFsk(framedData, baudRate);
-                    playPcmTrack(pcmSamples);
+                    AirLogger.i(TAG, "No active telephony call attached. Generating GGWave DSP acoustic waveform (" + data.length + " bytes)...");
+
+                    GGWaveEngine engine = GGWaveEngine.getInstance();
+                    boolean initialized = engine.init(SAMPLE_RATE);
+                    short[] pcmSamples = null;
+
+                    if (initialized) {
+                        pcmSamples = engine.encode(data, GGWaveEngine.PROTOCOL_AUDIBLE_FAST, 80);
+                    }
+
+                    // Fallback to internal continuous-phase FSK if native engine is unavailable
+                    if (pcmSamples == null || pcmSamples.length == 0) {
+                        AirLogger.w(TAG, "GGWave encoding returned empty. Falling back to internal continuous-phase FSK synthesizer.");
+                        byte[] framedData = applyFrameEncapsulation(data);
+                        pcmSamples = generateContinuousPhaseFsk(framedData, baudRate);
+                        playPcmTrack(pcmSamples, FALLBACK_SAMPLE_RATE);
+                    } else {
+                        playPcmTrack(pcmSamples, SAMPLE_RATE);
+                    }
 
                     if (listener != null) {
                         listener.onProgress(1, 1, 100);
@@ -301,7 +317,7 @@ public class AudioEncoder {
     public static short[] generateContinuousPhaseFsk(byte[] data, int baud) {
         if (data == null || data.length == 0) return new short[0];
 
-        double samplesPerBit = (double) SAMPLE_RATE / (double) baud;
+        double samplesPerBit = (double) FALLBACK_SAMPLE_RATE / (double) baud;
         int totalBits = data.length * 8;
         int totalSamples = (int) Math.round(totalBits * samplesPerBit);
 
@@ -313,7 +329,7 @@ public class AudioEncoder {
             for (int bit = 7; bit >= 0; bit--) {
                 int bitVal = (b >>> bit) & 1;
                 double targetFreq = (bitVal == 1) ? MARK_FREQ : SPACE_FREQ;
-                double phaseIncrement = (2.0 * Math.PI * targetFreq) / SAMPLE_RATE;
+                double phaseIncrement = (2.0 * Math.PI * targetFreq) / FALLBACK_SAMPLE_RATE;
 
                 for (int s = 0; s < samplesPerBit && sampleIndex < totalSamples; s++) {
                     output[sampleIndex++] = (short) (Math.sin(currentPhase) * 32767.0);
@@ -328,6 +344,10 @@ public class AudioEncoder {
     }
 
     private void playPcmTrack(short[] pcmSamples) {
+        playPcmTrack(pcmSamples, SAMPLE_RATE);
+    }
+
+    private void playPcmTrack(short[] pcmSamples, int sampleRate) {
         byte[] pcmBytes = convertShortsToBytes(pcmSamples);
 
         activeAudioTrack = new AudioTrack.Builder()
@@ -337,7 +357,7 @@ public class AudioEncoder {
                                 .build())
                         .setAudioFormat(new AudioFormat.Builder()
                                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                                .setSampleRate(SAMPLE_RATE)
+                                .setSampleRate(sampleRate)
                                 .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                                 .build())
                         .setBufferSizeInBytes(pcmBytes.length)
@@ -347,7 +367,7 @@ public class AudioEncoder {
         activeAudioTrack.write(pcmBytes, 0, pcmBytes.length);
         activeAudioTrack.play();
 
-        long durationMs = (long) (((double) pcmSamples.length / (double) SAMPLE_RATE) * 1000.0) + 100;
+        long durationMs = (long) (((double) pcmSamples.length / (double) sampleRate) * 1000.0) + 100;
         try {
             Thread.sleep(durationMs);
         } catch (InterruptedException ignored) {
