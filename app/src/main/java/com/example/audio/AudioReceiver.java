@@ -17,7 +17,8 @@ public class AudioReceiver {
 
     private static final String TAG = "AudioReceiver";
 
-    public static final int DEFAULT_SAMPLE_RATE = 44100;
+    public static final int DEFAULT_SAMPLE_RATE = 48000;
+    public static final int FALLBACK_SAMPLE_RATE = 44100;
     public static final byte SYNC_PREAMBLE = (byte) 0xAA;
     public static final byte START_FRAME_DELIMITER = (byte) 0x7E;
 
@@ -98,7 +99,7 @@ public class AudioReceiver {
         if (isListening.get()) return;
 
         // Hardware Compatibility Probe Matrix (Supports Huawei EMUI, ColorOS, and Standard Android)
-        int[] sampleRates = new int[]{44100, 48000, 16000, 8000};
+        int[] sampleRates = new int[]{48000, 44100, 16000, 8000};
         int[] audioSources = new int[]{
                 MediaRecorder.AudioSource.VOICE_RECOGNITION, // Unlocked on Huawei EMUI during calls
                 9,                                           // AudioSource.UNPROCESSED (Direct hardware ADC)
@@ -183,6 +184,13 @@ public class AudioReceiver {
     }
 
     private void listenLoop() {
+        // Initialize the native DSP engine for the active hardware sampling rate
+        GGWaveEngine ggwaveEngine = GGWaveEngine.getInstance();
+        boolean ggwaveReady = ggwaveEngine.init(activeSampleRate);
+
+        int pcmFrameSize = 1024;
+        short[] pcmBuffer = new short[pcmFrameSize];
+
         double samplesPerBit = (double) activeSampleRate / (double) baudRate;
         int bitSampleLen = Math.max((int) Math.round(samplesPerBit), 1);
         short[] bitBuffer = new short[bitSampleLen];
@@ -205,21 +213,31 @@ public class AudioReceiver {
                 break;
             }
 
-            int read = audioRecord.read(bitBuffer, 0, bitBuffer.length);
+            int read = audioRecord.read(pcmBuffer, 0, pcmBuffer.length);
             if (read > 0) {
+                // 1. Primary DSP Path: Feed raw PCM audio frames directly to GGWave native demodulator
+                if (ggwaveReady) {
+                    byte[] decodedPayload = ggwaveEngine.decode(pcmBuffer, read);
+                    if (decodedPayload != null && decodedPayload.length > 0) {
+                        AirLogger.i(TAG, "GGWave native decoder received valid error-corrected frame (" + decodedPayload.length + " bytes)");
+                        handleDecodedPayload(decodedPayload);
+                    }
+                }
+
                 // Diagnostic check to verify non-zero PCM energy
-                double currentRms = calculateRmsEnergy(bitBuffer, read);
+                double currentRms = calculateRmsEnergy(pcmBuffer, read);
                 if (currentRms == 0.0) {
                     consecutiveZeroEnergyCount++;
                     if (consecutiveZeroEnergyCount % 100 == 1) {
                         AirLogger.w(TAG, "DIAGNOSTIC WARNING: Zero-energy PCM buffer detected (" 
-                                + consecutiveZeroEnergyCount + " consecutive frames). Operating system call privacy filters may be silenecing the microphone input.");
+                                + consecutiveZeroEnergyCount + " consecutive frames). Operating system call privacy filters may be silencing the microphone input.");
                     }
                 } else {
                     consecutiveZeroEnergyCount = 0;
                 }
 
-                int bitVal = AudioDecoder.detectBit(bitBuffer, 0, read, activeSampleRate);
+                // 2. Secondary/Fallback DSP Path: Continuous bit detection loop for FSK/Handshakes
+                int bitVal = AudioDecoder.detectBit(pcmBuffer, 0, Math.min(read, bitSampleLen), activeSampleRate);
 
                 if (bitVal == -1) {
                     consecutiveSilenceCount++;
@@ -340,7 +358,7 @@ public class AudioReceiver {
                             }
                         }
 
-                        // Mode 2/3 Raw Binary Packet Frame flush (Strict validation: must start with 0x53 'S' and be exactly 263 bytes)
+                        // Mode 2/3 Raw Binary Packet Frame flush
                         if (!isAccumulatingImage && frameBuffer.size() == 263 && currentBufferBytes[0] == 0x53) {
                             if (listener != null) {
                                 listener.onFrameDecoded(currentBufferBytes);
@@ -362,6 +380,39 @@ public class AudioReceiver {
         // Flush remaining frame if stream ended
         if (frameBuffer.size() > 0 && listener != null) {
             listener.onFrameDecoded(frameBuffer.toByteArray());
+        }
+    }
+
+    private void handleDecodedPayload(byte[] payload) {
+        if (payload == null || payload.length == 0) return;
+
+        String asText = new String(payload, StandardCharsets.UTF_8);
+
+        if (asText.contains(CMD_RECEIVER_READY)) {
+            AirLogger.i(TAG, "GGWave decoded AIR_ACK:RECEIVER_READY");
+            if (listener != null) listener.onReceiverReadyAckReceived();
+            return;
+        }
+
+        if (asText.contains(CMD_ACTIVATE_RECEIVER)) {
+            AirLogger.i(TAG, "GGWave decoded AIR_CMD:ACTIVATE_RECEIVER");
+            if (listener != null) listener.onReceiverActivationCommand();
+            return;
+        }
+
+        if (payload.length == TemplateToken.TOKEN_BYTE_SIZE) {
+            TemplateToken token = TemplateToken.fromByteArray(payload);
+            if (token != null && token.isValid()) {
+                AirLogger.i(TAG, "GGWave decoded TemplateToken! ID=" + token.getTemplateId());
+                if (listener != null) {
+                    listener.onTokenDecoded(token);
+                }
+                return;
+            }
+        }
+
+        if (listener != null) {
+            listener.onFrameDecoded(payload);
         }
     }
 
