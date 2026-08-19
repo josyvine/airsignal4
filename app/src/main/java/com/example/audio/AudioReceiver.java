@@ -222,7 +222,7 @@ public class AudioReceiver {
                 if (ggwaveReady) {
                     byte[] decodedPayload = ggwaveEngine.decode(pcmBuffer, read);
                     if (decodedPayload != null && decodedPayload.length > 0) {
-                        AirLogger.i(TAG, "GGWave native decoder received valid error-corrected frame (" + decodedPayload.length + " bytes)");
+                        AirLogger.i(TAG, "GGWave native decoder received valid error-corrected packet (" + decodedPayload.length + " bytes)");
                         handleDecodedPayload(decodedPayload);
                     }
                 }
@@ -245,13 +245,11 @@ public class AudioReceiver {
                 if (bitVal == -1) {
                     consecutiveSilenceCount++;
 
-                    // If an image stream was accumulated and silence interval is reached, deliver the complete stream
-                    if (isAccumulatingImage && frameBuffer.size() > 50 && consecutiveSilenceCount > 30) {
-                        byte[] fullStreamBytes = frameBuffer.toByteArray();
-                        AirLogger.i(TAG, "End of audio transmission detected via silence interval. Delivering full Phonetic Image (" + fullStreamBytes.length + " bytes).");
-                        if (listener != null) {
-                            listener.onFrameDecoded(fullStreamBytes);
-                        }
+                    // If a stream chunk was accumulating and silence interval is reached, deliver the complete frame
+                    if (isLockedOnPreamble && frameBuffer.size() > 10 && consecutiveSilenceCount > 30) {
+                        byte[] completedFrame = frameBuffer.toByteArray();
+                        AirLogger.i(TAG, "FSK Fallback frame delivered via silence interval (" + completedFrame.length + " bytes).");
+                        handleDecodedPayload(completedFrame);
                         isLockedOnPreamble = false;
                         isAccumulatingImage = false;
                         consecutiveSilenceCount = 0;
@@ -305,13 +303,17 @@ public class AudioReceiver {
                         continue;
                     }
 
-                    // 3. Direct Sliding Lock for Phonetic Image Stream
-                    if (!isAccumulatingImage && currentWindowStr.contains(PhoneticImageTransceiver.PHONETIC_IMG_PREAMBLE)) {
-                        AirLogger.i(TAG, "Phonetic Image preamble detected via sliding window! Locking stream.");
+                    // 3. Direct Sliding Lock for Sequenced Chunks or Legacy Streams
+                    if (!isAccumulatingImage && (currentWindowStr.contains(PhoneticImageTransceiver.PHONETIC_IMG_PREAMBLE) || currentWindowStr.contains(PhoneticImageTransceiver.CHUNK_PREAMBLE))) {
+                        AirLogger.i(TAG, "Image packet preamble detected via FSK sliding window! Locking stream.");
                         isLockedOnPreamble = true;
                         isAccumulatingImage = true;
                         frameBuffer.reset();
-                        byte[] preambleBytes = PhoneticImageTransceiver.PHONETIC_IMG_PREAMBLE.getBytes(StandardCharsets.UTF_8);
+                        
+                        String matchedPreamble = currentWindowStr.contains(PhoneticImageTransceiver.CHUNK_PREAMBLE) ? 
+                                PhoneticImageTransceiver.CHUNK_PREAMBLE : PhoneticImageTransceiver.PHONETIC_IMG_PREAMBLE;
+                        
+                        byte[] preambleBytes = matchedPreamble.getBytes(StandardCharsets.UTF_8);
                         frameBuffer.write(preambleBytes, 0, preambleBytes.length);
                         slidingWindow.setLength(0);
                         continue;
@@ -325,55 +327,16 @@ public class AudioReceiver {
                             frameBuffer.reset();
                         }
                     } else {
-                        frameBuffer.write(completedByte);
-
-                        byte[] currentBufferBytes = frameBuffer.toByteArray();
-
-                        // Mode 4 Check: If 16 bytes accumulated, attempt TemplateToken validation
-                        if (!isAccumulatingImage && frameBuffer.size() == TemplateToken.TOKEN_BYTE_SIZE) {
-                            TemplateToken token = TemplateToken.fromByteArray(currentBufferBytes);
-                            if (token != null && token.isValid()) {
-                                AirLogger.i(TAG, "Mode 4 Token detected automatically! ID=" + token.getTemplateId());
-                                if (listener != null) {
-                                    listener.onTokenDecoded(token);
-                                }
-                                isLockedOnPreamble = false;
-                                frameBuffer.reset();
-                                continue;
+                        // If we are locked and hit another 0x7E delimiter, it signifies the end of a chunk
+                        if (completedByte == START_FRAME_DELIMITER) {
+                            if (frameBuffer.size() > 10) {
+                                byte[] completedFrame = frameBuffer.toByteArray();
+                                AirLogger.i(TAG, "FSK Fallback frame delivered via frame delimiter (" + completedFrame.length + " bytes).");
+                                handleDecodedPayload(completedFrame);
                             }
-                        }
-
-                        // Accumulate Phonetic Base64 Image
-                        if (isAccumulatingImage) {
-                            String preview = new String(currentBufferBytes, StandardCharsets.UTF_8);
-                            int firstHash = preview.indexOf('#');
-                            int lastHash = preview.lastIndexOf('#');
-                            if (firstHash != -1 && lastHash > firstHash && (preview.endsWith("#") || countOccurrences(preview, '#') >= 2)) {
-                                AirLogger.i(TAG, "Complete Phonetic Image stream accumulated (" + currentBufferBytes.length + " bytes). Delivering.");
-                                if (listener != null) {
-                                    listener.onFrameDecoded(currentBufferBytes);
-                                }
-                                isLockedOnPreamble = false;
-                                isAccumulatingImage = false;
-                                frameBuffer.reset();
-                                slidingWindow.setLength(0);
-                                continue;
-                            }
-                        }
-
-                        // Mode 2/3 Raw Binary Packet Frame flush
-                        if (!isAccumulatingImage && frameBuffer.size() == 263 && currentBufferBytes[0] == 0x53) {
-                            if (listener != null) {
-                                listener.onFrameDecoded(currentBufferBytes);
-                            }
-                            isLockedOnPreamble = false;
                             frameBuffer.reset();
-                        } else if (!isAccumulatingImage && frameBuffer.size() >= MAX_STREAM_BUFFER_SIZE) {
-                            if (listener != null) {
-                                listener.onFrameDecoded(currentBufferBytes);
-                            }
-                            isLockedOnPreamble = false;
-                            frameBuffer.reset();
+                        } else {
+                            frameBuffer.write(completedByte);
                         }
                     }
                 }
@@ -381,24 +344,27 @@ public class AudioReceiver {
         }
 
         // Flush remaining frame if stream ended
-        if (frameBuffer.size() > 0 && listener != null) {
-            listener.onFrameDecoded(frameBuffer.toByteArray());
+        if (frameBuffer.size() > 10) {
+            handleDecodedPayload(frameBuffer.toByteArray());
         }
     }
 
+    /**
+     * Safely routes fully extracted packets to the application layer.
+     */
     private void handleDecodedPayload(byte[] payload) {
         if (payload == null || payload.length == 0) return;
 
         String asText = new String(payload, StandardCharsets.UTF_8);
 
         if (asText.contains(CMD_RECEIVER_READY)) {
-            AirLogger.i(TAG, "GGWave decoded AIR_ACK:RECEIVER_READY");
+            AirLogger.i(TAG, "Decoded AIR_ACK:RECEIVER_READY");
             if (listener != null) listener.onReceiverReadyAckReceived();
             return;
         }
 
         if (asText.contains(CMD_ACTIVATE_RECEIVER)) {
-            AirLogger.i(TAG, "GGWave decoded AIR_CMD:ACTIVATE_RECEIVER");
+            AirLogger.i(TAG, "Decoded AIR_CMD:ACTIVATE_RECEIVER");
             if (listener != null) listener.onReceiverActivationCommand();
             return;
         }
@@ -406,7 +372,7 @@ public class AudioReceiver {
         if (payload.length == TemplateToken.TOKEN_BYTE_SIZE) {
             TemplateToken token = TemplateToken.fromByteArray(payload);
             if (token != null && token.isValid()) {
-                AirLogger.i(TAG, "GGWave decoded TemplateToken! ID=" + token.getTemplateId());
+                AirLogger.i(TAG, "Decoded TemplateToken! ID=" + token.getTemplateId());
                 if (listener != null) {
                     listener.onTokenDecoded(token);
                 }
@@ -414,17 +380,10 @@ public class AudioReceiver {
             }
         }
 
+        // Passes the packet directly to the Activity/Service, which routes it into PhoneticImageTransceiver
         if (listener != null) {
             listener.onFrameDecoded(payload);
         }
-    }
-
-    private int countOccurrences(String str, char ch) {
-        int count = 0;
-        for (int i = 0; i < str.length(); i++) {
-            if (str.charAt(i) == ch) count++;
-        }
-        return count;
     }
 
     public void stopListening() {
