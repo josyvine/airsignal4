@@ -31,10 +31,6 @@ public class AudioEncoder {
     public static final String CMD_ACTIVATE_RECEIVER = "AIR_CMD:ACTIVATE_RECEIVER";
     public static final String CMD_RECEIVER_READY = "AIR_ACK:RECEIVER_READY";
 
-    // DTMF tone duration metrics for cellular voice channel transmission
-    private static final int DTMF_TONE_DURATION_MS = 60;
-    private static final int DTMF_PAUSE_DURATION_MS = 30;
-
     private int baudRate = 1200; // 300, 600, 1200, 2400
     private final AtomicBoolean isTransmitting = new AtomicBoolean(false);
     private AudioTrack activeAudioTrack;
@@ -78,12 +74,6 @@ public class AudioEncoder {
                 activeAudioTrack = null;
             }
         }
-        Call call = AirSignalInCallService.getActiveCall();
-        if (call != null) {
-            try {
-                call.stopDtmfTone();
-            } catch (Exception ignored) {}
-        }
     }
 
     /**
@@ -112,9 +102,9 @@ public class AudioEncoder {
     }
 
     /**
-     * Transmits a single payload over the voice call.
-     * Uses Call.playDtmfTone to bypass hardware AEC during calls, with GGWave MFSK native engine
-     * and synthesized PCM fallback for speaker acoustic channels.
+     * Transmits a single payload over the speaker.
+     * Uses GGWave MFSK native engine optimized for telephony compression (AMR codecs),
+     * with synthesized PCM FSK fallback.
      */
     public void transmitDataOverAudio(final byte[] data, final OnTransmissionProgressListener listener) {
         if (data == null || data.length == 0) {
@@ -125,37 +115,32 @@ public class AudioEncoder {
         new Thread(() -> {
             isTransmitting.set(true);
             try {
-                Call activeCall = AirSignalInCallService.getActiveCall();
+                // Notice: We completely bypass DTMF dial tones. 
+                // We ALWAYS generate the acoustic MFSK sound wave out of the loudspeaker.
+                AirLogger.i(TAG, "Generating GGWave DSP acoustic waveform (" + data.length + " bytes)...");
 
-                // If active cellular call is present, transmit using telephony in-call signaling
-                if (activeCall != null && activeCall.getState() == Call.STATE_ACTIVE) {
-                    AirLogger.i(TAG, "Transmitting data payload directly over active cellular call channel (" + data.length + " bytes)...");
-                    transmitPayloadViaCallChannel(activeCall, data, listener);
+                GGWaveEngine engine = GGWaveEngine.getInstance();
+                boolean initialized = engine.init(SAMPLE_RATE);
+                short[] pcmSamples = null;
+
+                if (initialized) {
+                    // PROTOCOL_AUDIBLE_NORMAL is specifically designed to survive active cellular voice calls
+                    pcmSamples = engine.encode(data, GGWaveEngine.PROTOCOL_AUDIBLE_NORMAL, 80);
+                }
+
+                // Fallback to internal continuous-phase FSK if native engine is unavailable
+                if (pcmSamples == null || pcmSamples.length == 0) {
+                    AirLogger.w(TAG, "GGWave encoding returned empty. Falling back to internal continuous-phase FSK synthesizer.");
+                    byte[] framedData = applyFrameEncapsulation(data);
+                    pcmSamples = generateContinuousPhaseFsk(framedData, baudRate);
+                    playPcmTrack(pcmSamples, FALLBACK_SAMPLE_RATE);
                 } else {
-                    AirLogger.i(TAG, "No active telephony call attached. Generating GGWave DSP acoustic waveform (" + data.length + " bytes)...");
+                    playPcmTrack(pcmSamples, SAMPLE_RATE);
+                }
 
-                    GGWaveEngine engine = GGWaveEngine.getInstance();
-                    boolean initialized = engine.init(SAMPLE_RATE);
-                    short[] pcmSamples = null;
-
-                    if (initialized) {
-                        pcmSamples = engine.encode(data, GGWaveEngine.PROTOCOL_AUDIBLE_FAST, 80);
-                    }
-
-                    // Fallback to internal continuous-phase FSK if native engine is unavailable
-                    if (pcmSamples == null || pcmSamples.length == 0) {
-                        AirLogger.w(TAG, "GGWave encoding returned empty. Falling back to internal continuous-phase FSK synthesizer.");
-                        byte[] framedData = applyFrameEncapsulation(data);
-                        pcmSamples = generateContinuousPhaseFsk(framedData, baudRate);
-                        playPcmTrack(pcmSamples, FALLBACK_SAMPLE_RATE);
-                    } else {
-                        playPcmTrack(pcmSamples, SAMPLE_RATE);
-                    }
-
-                    if (listener != null) {
-                        listener.onProgress(1, 1, 100);
-                        listener.onComplete();
-                    }
+                if (listener != null) {
+                    listener.onProgress(1, 1, 100);
+                    listener.onComplete();
                 }
             } catch (Exception e) {
                 AirLogger.e(TAG, "Transmission failed", e);
@@ -164,73 +149,6 @@ public class AudioEncoder {
                 isTransmitting.set(false);
             }
         }).start();
-    }
-
-    /**
-     * Transmits data across the cellular network using telephony-whitelisted dual-frequency bursts.
-     */
-    private void transmitPayloadViaCallChannel(Call call, byte[] data, OnTransmissionProgressListener listener) throws InterruptedException {
-        // Convert raw byte stream into hexadecimal character pairs
-        StringBuilder hexString = new StringBuilder();
-        for (byte b : data) {
-            hexString.append(String.format("%02X", b));
-        }
-        String symbols = hexString.toString();
-        int totalSymbols = symbols.length();
-
-        for (int i = 0; i < totalSymbols; i++) {
-            if (!isTransmitting.get()) break;
-
-            char hexChar = symbols.charAt(i);
-            char dtmfDigit = hexCharToDtmf(hexChar);
-
-            try {
-                call.playDtmfTone(dtmfDigit);
-            } catch (Exception e) {
-                AirLogger.w(TAG, "Exception during call.playDtmfTone: " + e.getMessage());
-            }
-
-            Thread.sleep(DTMF_TONE_DURATION_MS);
-
-            try {
-                call.stopDtmfTone();
-            } catch (Exception ignored) {}
-
-            Thread.sleep(DTMF_PAUSE_DURATION_MS);
-
-            if (listener != null && i % 4 == 0) {
-                int percent = (int) (((i + 1) / (float) totalSymbols) * 100);
-                listener.onProgress(i + 1, totalSymbols, percent);
-            }
-        }
-
-        if (listener != null) {
-            listener.onProgress(totalSymbols, totalSymbols, 100);
-            listener.onComplete();
-        }
-    }
-
-    private char hexCharToDtmf(char hex) {
-        char upper = Character.toUpperCase(hex);
-        switch (upper) {
-            case '0': return '0';
-            case '1': return '1';
-            case '2': return '2';
-            case '3': return '3';
-            case '4': return '4';
-            case '5': return '5';
-            case '6': return '6';
-            case '7': return '7';
-            case '8': return '8';
-            case '9': return '9';
-            case 'A': return 'A';
-            case 'B': return 'B';
-            case 'C': return 'C';
-            case 'D': return 'D';
-            case 'E': return '*';
-            case 'F': return '#';
-            default: return '0';
-        }
     }
 
     /**
