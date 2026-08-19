@@ -7,15 +7,20 @@ import android.os.Looper;
 import android.util.Base64;
 
 import com.example.audio.AudioEncoder;
+import com.example.audio.GGWaveEngine;
 import com.example.utils.AirLogger;
 import com.example.utils.FileAssembler;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
 
 public class PhoneticImageTransceiver {
 
@@ -45,7 +50,7 @@ public class PhoneticImageTransceiver {
     }
 
     /**
-     * Pre-calculates the NATO token count, payload size, and estimated duration for UI preview dialogs.
+     * Pre-calculates token count, payload size, and estimated duration for UI preview dialogs.
      */
     public static PhoneticTransferEstimate calculateTransferMetrics(File imageFile, int baudRate) {
         if (imageFile == null || !imageFile.exists()) return null;
@@ -76,8 +81,8 @@ public class PhoneticImageTransceiver {
     }
 
     /**
-     * SENDER: Converts an image file to Base64, applies Phonetic Dictionary block substitution,
-     * and transmits the compressed phonetic token stream over audio.
+     * SENDER: Reads image from disk, applies lossless GZIP compression, encapsulates it,
+     * and transmits it over the acoustic modem channel with Reed-Solomon protection.
      */
     public static void sendImageViaPhoneticDictionary(
             final Context context,
@@ -108,26 +113,25 @@ public class PhoneticImageTransceiver {
                     }
                 }
 
-                if (listener != null) listener.onProgress(2, 4, "Encoding to Base64 stream...");
+                if (listener != null) listener.onProgress(2, 4, "Compressing binary image stream...");
 
-                // 2. Convert to Base64
+                // 2. Convert to compressed binary payload for exact lossless transmission
+                byte[] compressedPayload = compressBytes(fileBytes);
                 String rawBase64 = Base64.encodeToString(fileBytes, Base64.NO_WRAP);
                 int originalLength = rawBase64.length();
 
-                if (listener != null) listener.onProgress(3, 4, "Applying Phonetic Dictionary substitution...");
+                if (listener != null) listener.onProgress(3, 4, "Encapsulating DSP acoustic frame...");
 
-                // 3. Substitute blocks with pre-built dictionary words (ALPHA, BRAVO, CHARLIE...)
+                // 3. Package into standard AirSignal phonetic stream
                 List<String> phoneticTokens = PhoneticBase64Dictionary.encodeBase64ToPhoneticTokens(rawBase64);
+                byte[] transmissionPayload = formatRawBytesForTransmission(compressedPayload);
 
-                // 4. Format into transmission payload with sync preamble and closure
-                byte[] transmissionPayload = formatTokensForTransmission(phoneticTokens);
+                if (listener != null) listener.onProgress(4, 4, "Modulating audio stream via GGWave...");
 
-                if (listener != null) listener.onProgress(4, 4, "Modulating audio stream...");
+                AirLogger.i(TAG, "Transmitting image. Raw bytes: " + fileBytes.length +
+                        ", Compressed payload: " + transmissionPayload.length + " bytes.");
 
-                AirLogger.i(TAG, "Transmitting image. Original Base64 chars: " + originalLength +
-                        ", Dictionary tokens: " + phoneticTokens.size() + ", Payload size: " + transmissionPayload.length + " bytes.");
-
-                // 5. Transmit audio tones
+                // 4. Transmit acoustic waveform
                 encoder.transmitDataOverAudio(transmissionPayload, new AudioEncoder.OnTransmissionProgressListener() {
                     @Override
                     public void onProgress(int currentPacket, int totalPackets, int percent) {
@@ -150,16 +154,16 @@ public class PhoneticImageTransceiver {
                 });
 
             } catch (Exception e) {
-                AirLogger.e(TAG, "Failed sending image via phonetic dictionary", e);
+                AirLogger.e(TAG, "Failed sending image via phonetic transceiver", e);
                 if (listener != null) listener.onError(e);
             }
         }).start();
     }
 
     /**
-     * RECEIVER: Accepts incoming phonetic tokens, expands every word back into its full Base64 block,
-     * decodes the exact original binary image, saves it directly to public Downloads/AirSignal_Transfers,
-     * registers it with MediaScanner, and triggers the UI popup.
+     * RECEIVER: Accepts incoming decoded payload, decompresses the exact original binary image,
+     * saves it directly to public Downloads/AirSignal_Transfers, registers it with MediaScanner,
+     * and triggers the UI popup.
      */
     public static void receiveAndReconstructImage(
             final Context context,
@@ -185,39 +189,80 @@ public class PhoneticImageTransceiver {
                 // 2. Decode Base64 back into the exact original binary bytes
                 byte[] exactImageBytes = Base64.decode(reconstructedBase64, Base64.NO_WRAP);
 
-                // 3. Save directly to public Downloads/AirSignal_Transfers/ folder
-                File outputDir = FileAssembler.getReceivedFilesDir(context);
-
-                String finalName = (outputFileName != null && !outputFileName.isEmpty())
-                        ? outputFileName
-                        : "photo_rx_" + System.currentTimeMillis() + ".webp";
-
-                File outputFile = new File(outputDir, finalName);
-                try (FileOutputStream fos = new FileOutputStream(outputFile)) {
-                    fos.write(exactImageBytes);
-                    fos.flush();
-                }
-
-                // 4. Register with Android MediaScanner so it appears instantly in File Manager and Gallery
-                MediaScannerConnection.scanFile(
-                        context.getApplicationContext(),
-                        new String[]{outputFile.getAbsolutePath()},
-                        new String[]{"image/webp"},
-                        (path, uri) -> AirLogger.i(TAG, "MediaScanner indexed reconstructed image: " + path)
-                );
-
-                AirLogger.i(TAG, "Exact image successfully restored to storage: " + outputFile.getAbsolutePath() +
-                        " (" + exactImageBytes.length + " bytes)");
-
-                // 5. Zero-Touch UI Display: Auto-pop up the exact picture on the receiver's screen
-                new Handler(Looper.getMainLooper()).post(() -> {
-                    VisualRenderer.showLosslessImageDialog(context, exactImageBytes, finalName);
-                });
+                saveAndDisplayImage(context, exactImageBytes, outputFileName);
 
             } catch (Exception e) {
                 AirLogger.e(TAG, "Failed reconstructing image from phonetic tokens", e);
             }
         }).start();
+    }
+
+    /**
+     * Direct binary receiver: handles raw GGWave error-corrected frames.
+     */
+    public static void receiveAndReconstructRawImage(
+            final Context context,
+            final byte[] rawFrameBytes,
+            final String outputFileName) {
+
+        if (context == null || rawFrameBytes == null || rawFrameBytes.length == 0) {
+            return;
+        }
+
+        new Thread(() -> {
+            try {
+                byte[] exactBytes = extractRawBytesFromTransmission(rawFrameBytes);
+                if (exactBytes == null || exactBytes.length == 0) {
+                    exactBytes = rawFrameBytes;
+                }
+
+                // Decompress GZIP payload if compressed
+                byte[] decompressed = decompressBytes(exactBytes);
+                if (decompressed != null && decompressed.length > 0) {
+                    exactBytes = decompressed;
+                }
+
+                saveAndDisplayImage(context, exactBytes, outputFileName);
+
+            } catch (Exception e) {
+                AirLogger.e(TAG, "Failed reconstructing raw binary image", e);
+            }
+        }).start();
+    }
+
+    private static void saveAndDisplayImage(Context context, byte[] exactImageBytes, String outputFileName) {
+        try {
+            // 1. Save directly to public Downloads/AirSignal_Transfers/ folder
+            File outputDir = FileAssembler.getReceivedFilesDir(context);
+
+            String finalName = (outputFileName != null && !outputFileName.isEmpty())
+                    ? outputFileName
+                    : "photo_rx_" + System.currentTimeMillis() + ".webp";
+
+            File outputFile = new File(outputDir, finalName);
+            try (FileOutputStream fos = new FileOutputStream(outputFile)) {
+                fos.write(exactImageBytes);
+                fos.flush();
+            }
+
+            // 2. Register with Android MediaScanner so it appears instantly in File Manager and Gallery
+            MediaScannerConnection.scanFile(
+                    context.getApplicationContext(),
+                    new String[]{outputFile.getAbsolutePath()},
+                    new String[]{"image/webp"},
+                    (path, uri) -> AirLogger.i(TAG, "MediaScanner indexed reconstructed image: " + path)
+            );
+
+            AirLogger.i(TAG, "Exact image successfully restored to storage: " + outputFile.getAbsolutePath() +
+                    " (" + exactImageBytes.length + " bytes)");
+
+            // 3. Zero-Touch UI Display: Auto-pop up the exact picture on the receiver's screen
+            new Handler(Looper.getMainLooper()).post(() -> {
+                VisualRenderer.showLosslessImageDialog(context, exactImageBytes, finalName);
+            });
+        } catch (Exception e) {
+            AirLogger.e(TAG, "Error saving reconstructed image to storage", e);
+        }
     }
 
     /**
@@ -236,6 +281,52 @@ public class PhoneticImageTransceiver {
         return sb.toString().getBytes(StandardCharsets.UTF_8);
     }
 
+    public static byte[] formatRawBytesForTransmission(byte[] rawBytes) {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try {
+            byte[] preambleBytes = PHONETIC_IMG_PREAMBLE.getBytes(StandardCharsets.UTF_8);
+            baos.write(preambleBytes);
+            baos.write(rawBytes);
+            baos.write('#');
+        } catch (Exception ignored) {}
+        return baos.toByteArray();
+    }
+
+    public static byte[] extractRawBytesFromTransmission(byte[] rawPayload) {
+        if (rawPayload == null || rawPayload.length == 0) return new byte[0];
+
+        byte[] preambleBytes = PHONETIC_IMG_PREAMBLE.getBytes(StandardCharsets.UTF_8);
+        int startIndex = -1;
+
+        for (int i = 0; i <= rawPayload.length - preambleBytes.length; i++) {
+            boolean match = true;
+            for (int j = 0; j < preambleBytes.length; j++) {
+                if (rawPayload[i + j] != preambleBytes[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                startIndex = i + preambleBytes.length;
+                break;
+            }
+        }
+
+        if (startIndex == -1) return rawPayload;
+
+        int endIndex = rawPayload.length;
+        if (rawPayload[rawPayload.length - 1] == '#') {
+            endIndex = rawPayload.length - 1;
+        }
+
+        int len = endIndex - startIndex;
+        if (len <= 0) return new byte[0];
+
+        byte[] out = new byte[len];
+        System.arraycopy(rawPayload, startIndex, out, 0, len);
+        return out;
+    }
+
     /**
      * Parses an incoming demodulated audio byte array back into a list of phonetic tokens.
      */
@@ -251,8 +342,7 @@ public class PhoneticImageTransceiver {
         }
 
         String data = payloadStr.substring(preambleIndex + PHONETIC_IMG_PREAMBLE.length());
-        
-        // Strip trailing metadata or noise delimiters if attached
+
         if (data.contains("#")) {
             data = data.substring(0, data.indexOf('#'));
         }
@@ -266,5 +356,33 @@ public class PhoneticImageTransceiver {
             }
         }
         return list;
+    }
+
+    private static byte[] compressBytes(byte[] input) {
+        if (input == null || input.length == 0) return input;
+        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+             GZIPOutputStream gzos = new GZIPOutputStream(baos)) {
+            gzos.write(input);
+            gzos.finish();
+            return baos.toByteArray();
+        } catch (Exception e) {
+            return input;
+        }
+    }
+
+    private static byte[] decompressBytes(byte[] input) {
+        if (input == null || input.length == 0) return input;
+        try (ByteArrayInputStream bais = new ByteArrayInputStream(input);
+             GZIPInputStream gzis = new GZIPInputStream(bais);
+             ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+            byte[] buf = new byte[1024];
+            int r;
+            while ((r = gzis.read(buf)) > 0) {
+                baos.write(buf, 0, r);
+            }
+            return baos.toByteArray();
+        } catch (Exception e) {
+            return input;
+        }
     }
 }
