@@ -136,14 +136,25 @@ public class AudioDecoder {
     }
 
     /**
-     * Demodulates a continuous PCM audio buffer into a list of raw data bytes,
-     * stripping synchronization preambles automatically.
+     * Demodulates a continuous PCM audio buffer into a list of raw data bytes.
+     * Checks GGWave native MFSK demodulator first, then falls back to Goertzel bitstream extraction.
      */
     public static byte[] decodeFrameFromPcm(short[] pcmStream, int sampleRate, int baudRate) {
         if (pcmStream == null || pcmStream.length == 0 || baudRate <= 0) {
             return new byte[0];
         }
 
+        // Primary DSP Path: GGWave native decoding
+        GGWaveEngine engine = GGWaveEngine.getInstance();
+        if (engine.init(sampleRate)) {
+            byte[] nativeDecoded = engine.decode(pcmStream, pcmStream.length);
+            if (nativeDecoded != null && nativeDecoded.length > 0) {
+                AirLogger.i(TAG, "decodeFrameFromPcm: GGWave successfully decoded " + nativeDecoded.length + " bytes.");
+                return nativeDecoded;
+            }
+        }
+
+        // Secondary/Fallback DSP Path: FSK bit-slicing
         double samplesPerBit = (double) sampleRate / (double) baudRate;
         int totalBits = (int) (pcmStream.length / samplesPerBit);
 
