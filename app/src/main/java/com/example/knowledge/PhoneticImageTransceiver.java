@@ -19,6 +19,8 @@ import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
@@ -26,6 +28,14 @@ public class PhoneticImageTransceiver {
 
     private static final String TAG = "PhoneticImageTransceiver";
     public static final String PHONETIC_IMG_PREAMBLE = "PHON_IMG::";
+    
+    // New Streaming Protocol Header
+    public static final String CHUNK_PREAMBLE = "IMG_CHK:";
+
+    // Stateful receiver buffer for reassembling incoming stream packets
+    private static final Map<Integer, String> rxBuffer = new ConcurrentHashMap<>();
+    private static int rxExpectedChunks = -1;
+    private static long lastChunkTime = 0;
 
     public interface OnPhoneticTransferListener {
         void onProgress(int step, int totalSteps, String statusMessage);
@@ -59,18 +69,25 @@ public class PhoneticImageTransceiver {
             int read = fis.read(fileBytes);
             if (read != fileBytes.length) return null;
 
-            String rawBase64 = Base64.encodeToString(fileBytes, Base64.NO_WRAP);
+            byte[] compressed = compressBytes(fileBytes);
+            String rawBase64 = Base64.encodeToString(compressed, Base64.NO_WRAP);
             List<String> phoneticTokens = PhoneticBase64Dictionary.encodeBase64ToPhoneticTokens(rawBase64);
-            byte[] payload = formatTokensForTransmission(phoneticTokens);
+
+            int chunkSize = 150;
+            int totalChunks = (int) Math.ceil((double) rawBase64.length() / chunkSize);
+            
+            // Calculate payload based on chunks + headers
+            int payloadBytes = rawBase64.length() + (totalChunks * 16); 
 
             int baud = (baudRate > 0) ? baudRate : 1200;
-            int audioSeconds = (int) Math.ceil((payload.length * 8.0) / (double) baud);
-            int totalEstimatedSeconds = 5 + 1 + 5 + audioSeconds;
+            int audioSeconds = (int) Math.ceil((payloadBytes * 8.0) / (double) baud);
+            // Include wait gaps in estimation
+            int totalEstimatedSeconds = 5 + 1 + 5 + audioSeconds + (totalChunks * 0); 
 
             return new PhoneticTransferEstimate(
-                    phoneticTokens.size(),
+                    totalChunks, // Represents number of packets now
                     rawBase64.length(),
-                    payload.length,
+                    payloadBytes,
                     totalEstimatedSeconds,
                     phoneticTokens
             );
@@ -81,8 +98,8 @@ public class PhoneticImageTransceiver {
     }
 
     /**
-     * SENDER: Reads image from disk, applies lossless GZIP compression, encapsulates it,
-     * and transmits it over the acoustic modem channel with Reed-Solomon protection.
+     * SENDER: Reads image from disk, applies lossless GZIP compression, converts to Base64,
+     * sequences into safe 150-byte chunks, and streams sequentially over GGWave.
      */
     public static void sendImageViaPhoneticDictionary(
             final Context context,
@@ -104,7 +121,6 @@ public class PhoneticImageTransceiver {
             try {
                 if (listener != null) listener.onProgress(1, 4, "Reading image bytes from disk...");
 
-                // 1. Read raw image bytes
                 byte[] fileBytes = new byte[(int) imageFile.length()];
                 try (FileInputStream fis = new FileInputStream(imageFile)) {
                     int read = fis.read(fileBytes);
@@ -115,24 +131,33 @@ public class PhoneticImageTransceiver {
 
                 if (listener != null) listener.onProgress(2, 4, "Compressing binary image stream...");
 
-                // 2. Convert to compressed binary payload for exact lossless transmission
                 byte[] compressedPayload = compressBytes(fileBytes);
-                String rawBase64 = Base64.encodeToString(fileBytes, Base64.NO_WRAP);
+                String rawBase64 = Base64.encodeToString(compressedPayload, Base64.NO_WRAP);
                 int originalLength = rawBase64.length();
 
-                if (listener != null) listener.onProgress(3, 4, "Encapsulating DSP acoustic frame...");
+                if (listener != null) listener.onProgress(3, 4, "Sequencing DSP acoustic frames...");
 
-                // 3. Package into standard AirSignal phonetic stream
-                List<String> phoneticTokens = PhoneticBase64Dictionary.encodeBase64ToPhoneticTokens(rawBase64);
-                byte[] transmissionPayload = formatRawBytesForTransmission(compressedPayload);
+                // Chunk into safe 150-character limits to strictly obey GGWave's 256-byte maximum
+                int chunkSize = 150;
+                int totalChunks = (int) Math.ceil((double) rawBase64.length() / chunkSize);
+                List<byte[]> safeChunks = new ArrayList<>();
+
+                for (int i = 0; i < totalChunks; i++) {
+                    int start = i * chunkSize;
+                    int end = Math.min(rawBase64.length(), start + chunkSize);
+                    String chunkData = rawBase64.substring(start, end);
+                    
+                    // Add sequence header: IMG_CHK:index:totalChunks:data
+                    String packetStr = CHUNK_PREAMBLE + i + ":" + totalChunks + ":" + chunkData;
+                    safeChunks.add(packetStr.getBytes(StandardCharsets.UTF_8));
+                }
 
                 if (listener != null) listener.onProgress(4, 4, "Modulating audio stream via GGWave...");
 
-                AirLogger.i(TAG, "Transmitting image. Raw bytes: " + fileBytes.length +
-                        ", Compressed payload: " + transmissionPayload.length + " bytes.");
+                AirLogger.i(TAG, "Transmitting image. Payload sliced into " + safeChunks.size() + " sequenced chunks.");
 
-                // 4. Transmit acoustic waveform
-                encoder.transmitDataOverAudio(transmissionPayload, new AudioEncoder.OnTransmissionProgressListener() {
+                // Transmit as a synchronized stream queue
+                encoder.transmitRawStream(safeChunks, new AudioEncoder.OnTransmissionProgressListener() {
                     @Override
                     public void onProgress(int currentPacket, int totalPackets, int percent) {
                         if (listener != null) {
@@ -143,7 +168,7 @@ public class PhoneticImageTransceiver {
                     @Override
                     public void onComplete() {
                         if (listener != null) {
-                            listener.onSuccess(phoneticTokens.size(), originalLength);
+                            listener.onSuccess(totalChunks, originalLength);
                         }
                     }
 
@@ -161,9 +186,7 @@ public class PhoneticImageTransceiver {
     }
 
     /**
-     * RECEIVER: Accepts incoming decoded payload, decompresses the exact original binary image,
-     * saves it directly to public Downloads/AirSignal_Transfers, registers it with MediaScanner,
-     * and triggers the UI popup.
+     * Legacy Receiver function (kept for backward compatibility with pure phonetic text streams).
      */
     public static void receiveAndReconstructImage(
             final Context context,
@@ -178,7 +201,6 @@ public class PhoneticImageTransceiver {
             try {
                 AirLogger.i(TAG, "Reconstructing image from " + receivedTokens.size() + " phonetic tokens.");
 
-                // 1. Expand phonetic tokens back into the complete Base64 string
                 String reconstructedBase64 = PhoneticBase64Dictionary.decodePhoneticTokensToBase64(receivedTokens);
 
                 if (reconstructedBase64.isEmpty()) {
@@ -186,9 +208,7 @@ public class PhoneticImageTransceiver {
                     return;
                 }
 
-                // 2. Decode Base64 back into the exact original binary bytes
                 byte[] exactImageBytes = Base64.decode(reconstructedBase64, Base64.NO_WRAP);
-
                 saveAndDisplayImage(context, exactImageBytes, outputFileName);
 
             } catch (Exception e) {
@@ -198,7 +218,8 @@ public class PhoneticImageTransceiver {
     }
 
     /**
-     * Direct binary receiver: handles raw GGWave error-corrected frames.
+     * Direct binary receiver: handles incoming sequenced chunks, buffers them,
+     * and reassembles the full image once the stream finishes.
      */
     public static void receiveAndReconstructRawImage(
             final Context context,
@@ -211,12 +232,58 @@ public class PhoneticImageTransceiver {
 
         new Thread(() -> {
             try {
+                String packetStr = new String(rawFrameBytes, StandardCharsets.UTF_8);
+
+                // Process standard sequenced packet (IMG_CHK:idx:total:data)
+                if (packetStr.startsWith(CHUNK_PREAMBLE)) {
+                    String[] parts = packetStr.split(":", 4);
+                    if (parts.length == 4) {
+                        int idx = Integer.parseInt(parts[1]);
+                        int total = Integer.parseInt(parts[2]);
+                        String base64Data = parts[3];
+
+                        // Clear buffer if this is a new stream session (timeout > 60 seconds)
+                        if (System.currentTimeMillis() - lastChunkTime > 60000) {
+                            rxBuffer.clear();
+                        }
+                        lastChunkTime = System.currentTimeMillis();
+
+                        rxBuffer.put(idx, base64Data);
+                        rxExpectedChunks = total;
+
+                        AirLogger.i(TAG, "Received frame packet " + (idx + 1) + " of " + total);
+
+                        // If buffer is full, reassemble and decompress
+                        if (rxBuffer.size() == rxExpectedChunks) {
+                            AirLogger.i(TAG, "All frames received successfully. Reassembling payload...");
+                            
+                            StringBuilder fullB64 = new StringBuilder();
+                            for (int i = 0; i < rxExpectedChunks; i++) {
+                                fullB64.append(rxBuffer.get(i));
+                            }
+                            
+                            rxBuffer.clear();
+                            rxExpectedChunks = -1;
+
+                            byte[] compressedBytes = Base64.decode(fullB64.toString(), Base64.NO_WRAP);
+                            byte[] exactBytes = decompressBytes(compressedBytes);
+
+                            if (exactBytes != null && exactBytes.length > 0) {
+                                saveAndDisplayImage(context, exactBytes, outputFileName);
+                            } else {
+                                AirLogger.e(TAG, "Decompression returned empty bytes.");
+                            }
+                        }
+                    }
+                    return; // Stop execution here since it was successfully buffered
+                }
+
+                // Fallback for legacy raw/unsequenced frames
                 byte[] exactBytes = extractRawBytesFromTransmission(rawFrameBytes);
                 if (exactBytes == null || exactBytes.length == 0) {
                     exactBytes = rawFrameBytes;
                 }
 
-                // Decompress GZIP payload if compressed
                 byte[] decompressed = decompressBytes(exactBytes);
                 if (decompressed != null && decompressed.length > 0) {
                     exactBytes = decompressed;
