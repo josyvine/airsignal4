@@ -102,9 +102,39 @@ public class AudioEncoder {
     }
 
     /**
-     * Transmits a single payload over the speaker.
-     * Uses GGWave MFSK native engine optimized for telephony compression (AMR codecs),
-     * with synthesized PCM FSK fallback.
+     * Core synchronous execution for encoding and playing acoustic data.
+     * This blocks the calling thread until the audio finishes playing.
+     */
+    private void executeTransmissionSync(byte[] data, OnTransmissionProgressListener listener) throws Exception {
+        AirLogger.i(TAG, "Generating GGWave DSP acoustic waveform (" + data.length + " bytes)...");
+
+        GGWaveEngine engine = GGWaveEngine.getInstance();
+        boolean initialized = engine.init(SAMPLE_RATE);
+        short[] pcmSamples = null;
+
+        if (initialized) {
+            // PROTOCOL_AUDIBLE_NORMAL is specifically designed to survive active cellular voice calls
+            pcmSamples = engine.encode(data, GGWaveEngine.PROTOCOL_AUDIBLE_NORMAL, 80);
+        }
+
+        // Fallback to internal continuous-phase FSK if native engine is unavailable
+        if (pcmSamples == null || pcmSamples.length == 0) {
+            AirLogger.w(TAG, "GGWave encoding returned empty. Falling back to internal continuous-phase FSK synthesizer.");
+            byte[] framedData = applyFrameEncapsulation(data);
+            pcmSamples = generateContinuousPhaseFsk(framedData, baudRate);
+            playPcmTrack(pcmSamples, FALLBACK_SAMPLE_RATE);
+        } else {
+            playPcmTrack(pcmSamples, SAMPLE_RATE);
+        }
+
+        if (listener != null) {
+            listener.onProgress(1, 1, 100);
+            listener.onComplete();
+        }
+    }
+
+    /**
+     * Transmits a single payload over the speaker asynchronously.
      */
     public void transmitDataOverAudio(final byte[] data, final OnTransmissionProgressListener listener) {
         if (data == null || data.length == 0) {
@@ -115,33 +145,7 @@ public class AudioEncoder {
         new Thread(() -> {
             isTransmitting.set(true);
             try {
-                // Notice: We completely bypass DTMF dial tones. 
-                // We ALWAYS generate the acoustic MFSK sound wave out of the loudspeaker.
-                AirLogger.i(TAG, "Generating GGWave DSP acoustic waveform (" + data.length + " bytes)...");
-
-                GGWaveEngine engine = GGWaveEngine.getInstance();
-                boolean initialized = engine.init(SAMPLE_RATE);
-                short[] pcmSamples = null;
-
-                if (initialized) {
-                    // PROTOCOL_AUDIBLE_NORMAL is specifically designed to survive active cellular voice calls
-                    pcmSamples = engine.encode(data, GGWaveEngine.PROTOCOL_AUDIBLE_NORMAL, 80);
-                }
-
-                // Fallback to internal continuous-phase FSK if native engine is unavailable
-                if (pcmSamples == null || pcmSamples.length == 0) {
-                    AirLogger.w(TAG, "GGWave encoding returned empty. Falling back to internal continuous-phase FSK synthesizer.");
-                    byte[] framedData = applyFrameEncapsulation(data);
-                    pcmSamples = generateContinuousPhaseFsk(framedData, baudRate);
-                    playPcmTrack(pcmSamples, FALLBACK_SAMPLE_RATE);
-                } else {
-                    playPcmTrack(pcmSamples, SAMPLE_RATE);
-                }
-
-                if (listener != null) {
-                    listener.onProgress(1, 1, 100);
-                    listener.onComplete();
-                }
+                executeTransmissionSync(data, listener);
             } catch (Exception e) {
                 AirLogger.e(TAG, "Transmission failed", e);
                 if (listener != null) listener.onError(e);
@@ -177,6 +181,7 @@ public class AudioEncoder {
 
     /**
      * Mode 2: Streams a multi-packet raw binary dataset incrementally.
+     * Uses a single background thread to process chunks sequentially, preventing thread explosions.
      */
     public void transmitRawStream(final List<byte[]> packets, final OnTransmissionProgressListener listener) {
         if (packets == null || packets.isEmpty()) {
@@ -193,12 +198,17 @@ public class AudioEncoder {
                     if (!isTransmitting.get()) break;
 
                     byte[] packetData = packets.get(i);
-                    transmitDataOverAudio(packetData, null);
+                    
+                    // Execute synchronously so we don't spawn 100+ threads simultaneously
+                    executeTransmissionSync(packetData, null);
 
                     int progressPercent = (int) (((i + 1) / (float) totalPackets) * 100);
                     if (listener != null) {
                         listener.onProgress(i + 1, totalPackets, progressPercent);
                     }
+
+                    // Add a brief acoustic silence gap between chunks to allow the receiver's DSP to finalize the frame
+                    Thread.sleep(200); 
                 }
 
                 if (isTransmitting.get() && listener != null) {
